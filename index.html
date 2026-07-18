@@ -1,0 +1,1031 @@
+import React, { useState, useMemo, useEffect, useCallback } from “react”;
+import {
+Search, AlertTriangle, ShieldCheck, Plus, X, Phone, FileText, Trash2,
+ChevronRight, TrendingUp, TrendingDown, Clock, MessageSquare, Send,
+Loader2, BarChart3, ArrowLeft,
+} from “lucide-react”;
+
+// ============================================================ helpers ===
+const uid = () => Math.random().toString(36).slice(2, 10);
+const THB = (n) =>
+new Intl.NumberFormat(“th-TH”, { style: “currency”, currency: “THB”, maximumFractionDigits: 0 }).format(n || 0);
+const fmtDate = (d) => (d ? new Date(d).toLocaleDateString(“th-TH”, { year: “numeric”, month: “short”, day: “numeric” }) : “ไม่ระบุ”);
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+
+const STATUS = {
+ok: { label: “ปกติ”, color: “#7DD3A0” },
+late: { label: “ค้างชำระ”, color: “#F5B942” },
+default: { label: “เบี้ยวหนี้”, color: “#E23B3B” },
+};
+
+const GRADE_COLORS = { A: “#7DD3A0”, B: “#A8D08D”, C: “#F5B942”, D: “#E8837A”, F: “#E23B3B” };
+
+const CONTACT_OUTCOMES = [
+{ key: “no_answer”, label: “โทรไม่ติด” },
+{ key: “promised”, label: “รับสาย - สัญญาว่าจะจ่าย” },
+{ key: “refused”, label: “รับสาย - ปฏิเสธ/เลี่ยง” },
+{ key: “paid”, label: “ชำระแล้วบางส่วน/ทั้งหมด” },
+{ key: “unreachable”, label: “ติดต่อไม่ได้เลย” },
+];
+
+const STORAGE_KEY = “debtor-ledger:v1”;
+
+// –– scoring engine —————————————————––
+// Transparent, explainable score built only from data the lender entered.
+function computeScore(debtor) {
+let score = 70; // baseline
+const factors = [];
+
+const payments = debtor.payments || [];
+const onTime = payments.filter((p) => p.onTime).length;
+const late = payments.filter((p) => !p.onTime).length;
+
+if (payments.length > 0) {
+const ratio = onTime / payments.length;
+const delta = Math.round((ratio - 0.5) * 60);
+score += delta;
+factors.push({
+label: `ชำระตรงเวลา ${onTime}/${payments.length} งวด`,
+impact: delta,
+});
+}
+
+if (debtor.status === “default”) {
+score -= 45;
+factors.push({ label: “สถานะปัจจุบัน: เบี้ยวหนี้”, impact: -45 });
+} else if (debtor.status === “late”) {
+score -= 20;
+factors.push({ label: “สถานะปัจจุบัน: ค้างชำระ”, impact: -20 });
+} else {
+score += 5;
+factors.push({ label: “สถานะปัจจุบัน: ปกติ”, impact: 5 });
+}
+
+const contacts = debtor.contactLog || [];
+const refusals = contacts.filter((c) => c.outcome === “refused”).length;
+const unreach = contacts.filter((c) => c.outcome === “unreachable”).length;
+if (refusals > 0) {
+const p = refusals * -8;
+score += p;
+factors.push({ label: `ปฏิเสธ/เลี่ยงการจ่าย ${refusals} ครั้ง`, impact: p });
+}
+if (unreach > 0) {
+const p = unreach * -10;
+score += p;
+factors.push({ label: `ติดต่อไม่ได้ ${unreach} ครั้ง`, impact: p });
+}
+
+const promises = contacts.filter((c) => c.outcome === “promised”).length;
+const brokenPromises = Math.max(0, promises - onTime);
+if (promises > 2 && onTime === 0) {
+score -= 10;
+factors.push({ label: “สัญญาจะจ่ายซ้ำๆ แต่ไม่มีการชำระจริง”, impact: -10 });
+}
+
+score = Math.max(0, Math.min(100, Math.round(score)));
+
+let grade = “F”;
+if (score >= 85) grade = “A”;
+else if (score >= 70) grade = “B”;
+else if (score >= 50) grade = “C”;
+else if (score >= 30) grade = “D”;
+
+return { score, grade, factors };
+}
+
+function statuteDeadline(dateStr, years = 10) {
+if (!dateStr) return null;
+const d = new Date(dateStr);
+d.setFullYear(d.getFullYear() + years);
+return d.toISOString().slice(0, 10);
+}
+
+function draftMessage(debtor, level) {
+const remaining = debtor.amount || 0;
+const today = new Date();
+const plus7 = new Date(today); plus7.setDate(plus7.getDate() + 7);
+const plus3 = new Date(today); plus3.setDate(plus3.getDate() + 3);
+
+if (level === “first”) {
+return `เรียน คุณ${debtor.name}\n\nตามสัญญาลงวันที่ ${fmtDate(debtor.date)} ท่านมียอดค้างชำระจำนวน ${THB(remaining)} ซึ่งครบกำหนดชำระแล้ว\n\nกรุณาชำระยอดดังกล่าวภายในวันที่ ${fmtDate(plus7.toISOString())} หากได้ชำระเรียบร้อยแล้ว รบกวนแจ้งหลักฐานการโอนกลับมาด้วย\n\nขอบคุณครับ/ค่ะ`;
+}
+if (level === “final”) {
+return `เรียน คุณ${debtor.name}\n\nนี่คือหนังสือแจ้งเตือนครั้งสุดท้าย เนื่องจากยอดค้างชำระจำนวน ${THB(remaining)} ตามสัญญาลงวันที่ ${fmtDate(debtor.date)} ยังไม่ได้รับการชำระ แม้ได้แจ้งเตือนไปก่อนหน้านี้แล้ว\n\nขอให้ท่านติดต่อกลับและชำระยอดค้างทั้งหมดภายในวันที่ ${fmtDate(plus3.toISOString())} หากพ้นกำหนดนี้โดยไม่มีการติดต่อหรือชำระ ข้าพเจ้าจำเป็นต้องดำเนินการตามสิทธิ์ทางกฎหมายขั้นต่อไปโดยไม่ต้องแจ้งให้ทราบล่วงหน้าอีก\n\nหากมีเหตุขัดข้อง กรุณาติดต่อเพื่อเจรจาก่อนถึงกำหนดดังกล่าว`;
+}
+return `เรียน คุณ${debtor.name}\n\nเนื่องจากยอดค้างชำระจำนวน ${THB(remaining)} ตามสัญญาลงวันที่ ${fmtDate(debtor.date)} เลยกำหนดชำระมาเป็นระยะเวลานาน และไม่ได้รับการติดต่อกลับตามที่แจ้งเตือนไปก่อนหน้านี้\n\nข้าพเจ้าอยู่ระหว่างเตรียมเอกสารเพื่อดำเนินคดีตามกฎหมาย ทั้งทางแพ่งเพื่อเรียกร้องยอดหนี้คืน และพิจารณาความรับผิดทางอาญาตามที่กฎหมายเอื้อให้ทำได้\n\nหากท่านประสงค์จะยุติเรื่องนี้ด้วยการเจรจา กรุณาติดต่อกลับภายใน 3 วันทำการ มิฉะนั้นข้าพเจ้าจะดำเนินการยื่นเรื่องต่อหน่วยงานที่เกี่ยวข้องทันทีโดยไม่มีการแจ้งเตือนเพิ่มเติม`;
+}
+
+// ============================================================ storage ===
+function useLedgerStorage() {
+const [debtors, setDebtors] = useState([]);
+const [loaded, setLoaded] = useState(false);
+const [saving, setSaving] = useState(false);
+const [error, setError] = useState(null);
+
+useEffect(() => {
+(async () => {
+try {
+const res = await window.storage.get(STORAGE_KEY, false);
+setDebtors(res ? JSON.parse(res.value) : seed());
+} catch {
+setDebtors(seed());
+} finally {
+setLoaded(true);
+}
+})();
+}, []);
+
+const persist = useCallback(async (next) => {
+setDebtors(next);
+setSaving(true);
+try {
+const res = await window.storage.set(STORAGE_KEY, JSON.stringify(next), false);
+if (!res) setError(“บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง”);
+else setError(null);
+} catch {
+setError(“บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง”);
+} finally {
+setSaving(false);
+}
+}, []);
+
+return { debtors, persist, loaded, saving, error };
+}
+
+function seed() {
+return [
+{
+id: uid(),
+name: “สมชาย ใจดี”,
+phone: “081-234-5678”,
+amount: 15000,
+date: “2025-11-02”,
+status: “default”,
+note: “อ้างว่าตกงาน ติดต่อไม่ได้หลังครบกำหนด 2 เดือน”,
+attachments: [],
+payments: [{ id: uid(), date: “2025-11-02”, amount: 0, onTime: false }],
+contactLog: [
+{ id: uid(), date: “2026-01-05”, outcome: “promised”, note: “บอกจะจ่ายสิ้นเดือน” },
+{ id: uid(), date: “2026-02-10”, outcome: “unreachable”, note: “โทรไม่ติดหลายครั้ง” },
+{ id: uid(), date: “2026-03-01”, outcome: “refused”, note: “ทักไลน์แล้วบล็อก” },
+],
+},
+{
+id: uid(),
+name: “วิภา รุ่งเรือง”,
+phone: “089-555-1122”,
+amount: 8000,
+date: “2026-03-15”,
+status: “ok”,
+note: “ผ่อนตรงเวลาทุกงวด”,
+attachments: [],
+payments: [
+{ id: uid(), date: “2026-04-15”, amount: 2000, onTime: true },
+{ id: uid(), date: “2026-05-15”, amount: 2000, onTime: true },
+{ id: uid(), date: “2026-06-15”, amount: 2000, onTime: true },
+],
+contactLog: [],
+},
+];
+}
+
+function fileToDataUrl(file) {
+return new Promise((resolve, reject) => {
+const r = new FileReader();
+r.onload = () => resolve(r.result);
+r.onerror = reject;
+r.readAsDataURL(file);
+});
+}
+
+// –– detective-noir starfield / constellation background —————
+function Starfield() {
+const canvasRef = React.useRef(null);
+
+useEffect(() => {
+const canvas = canvasRef.current;
+const ctx = canvas.getContext(“2d”);
+let raf;
+let w, h, stars;
+
+```
+const LINK_DIST = 140;
+const STAR_COUNT_DIVISOR = 9000; // fewer stars on small screens
+
+function resize() {
+  w = canvas.width = window.innerWidth;
+  h = canvas.height = window.innerHeight;
+  const count = Math.max(40, Math.min(140, Math.floor((w * h) / STAR_COUNT_DIVISOR)));
+  stars = Array.from({ length: count }, () => ({
+    x: Math.random() * w,
+    y: Math.random() * h,
+    r: Math.random() * 1.3 + 0.4,
+    vx: (Math.random() - 0.5) * 0.06,
+    vy: (Math.random() - 0.5) * 0.06,
+    tw: Math.random() * Math.PI * 2,
+  }));
+}
+
+function step() {
+  ctx.clearRect(0, 0, w, h);
+
+  // drift + twinkle
+  stars.forEach((s) => {
+    s.x += s.vx;
+    s.y += s.vy;
+    if (s.x < 0) s.x = w; if (s.x > w) s.x = 0;
+    if (s.y < 0) s.y = h; if (s.y > h) s.y = 0;
+    s.tw += 0.02;
+  });
+
+  // constellation threads (red, faint — echoes the corkboard string)
+  for (let i = 0; i < stars.length; i++) {
+    for (let j = i + 1; j < stars.length; j++) {
+      const a = stars[i], b = stars[j];
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < LINK_DIST) {
+        const alpha = (1 - dist / LINK_DIST) * 0.16;
+        ctx.strokeStyle = `rgba(192,57,43,${alpha})`;
+        ctx.lineWidth = 0.6;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // stars
+  stars.forEach((s) => {
+    const flicker = 0.55 + Math.sin(s.tw) * 0.35;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(237,231,228,${flicker * 0.75})`;
+    ctx.fill();
+  });
+
+  raf = requestAnimationFrame(step);
+}
+
+resize();
+step();
+window.addEventListener("resize", resize);
+return () => {
+  cancelAnimationFrame(raf);
+  window.removeEventListener("resize", resize);
+};
+```
+
+}, []);
+
+return <canvas ref={canvasRef} style={styles.starCanvas} aria-hidden="true" />;
+}
+
+// ============================================================ app =======
+export default function DebtorLedgerPro() {
+const { debtors, persist, loaded, saving, error } = useLedgerStorage();
+const [query, setQuery] = useState(””);
+const [checkResult, setCheckResult] = useState(null);
+const [view, setView] = useState(“check”);
+const [selected, setSelected] = useState(null);
+const [form, setForm] = useState(emptyForm());
+
+function emptyForm() {
+return { name: “”, phone: “”, amount: “”, date: “”, status: “ok”, note: “”, attachments: [] };
+}
+
+const norm = (s) => (s || “”).toLowerCase().replace(/[\s-]/g, “”);
+
+const runCheck = () => {
+const q = norm(query);
+if (!q) return setCheckResult(null);
+setCheckResult(debtors.filter((d) => norm(d.name).includes(q) || norm(d.phone).includes(q)));
+};
+
+const filteredList = useMemo(() => {
+if (view !== “list”) return debtors;
+const q = norm(query);
+if (!q) return debtors;
+return debtors.filter((d) => norm(d.name).includes(q) || norm(d.phone).includes(q));
+}, [debtors, query, view]);
+
+const handleFiles = async (fileList) => {
+const files = Array.from(fileList).slice(0, 4);
+const urls = await Promise.all(files.map(fileToDataUrl));
+setForm((f) => ({ …f, attachments: […f.attachments, …urls].slice(0, 4) }));
+};
+
+const saveDebtor = () => {
+if (!form.name.trim()) return;
+const newDebtor = { …form, id: uid(), amount: Number(form.amount) || 0, payments: [], contactLog: [] };
+persist([newDebtor, …debtors]);
+setForm(emptyForm());
+setView(“list”);
+};
+
+const deleteDebtor = (id) => {
+persist(debtors.filter((d) => d.id !== id));
+setSelected(null);
+};
+
+const updateDebtor = (id, patch) => {
+const next = debtors.map((d) => (d.id === id ? { …d, …patch } : d));
+persist(next);
+setSelected((s) => (s && s.id === id ? { …s, …patch } : s));
+};
+
+const addContact = (id, entry) => {
+const d = debtors.find((x) => x.id === id);
+updateDebtor(id, { contactLog: […(d.contactLog || []), entry] });
+};
+
+const addPayment = (id, entry) => {
+const d = debtors.find((x) => x.id === id);
+updateDebtor(id, { payments: […(d.payments || []), entry] });
+};
+
+const worstStatus = (list) => {
+if (list.some((d) => d.status === “default”)) return “default”;
+if (list.some((d) => d.status === “late”)) return “late”;
+return “ok”;
+};
+
+const portfolioStats = useMemo(() => {
+const total = debtors.reduce((s, d) => s + (d.amount || 0), 0);
+const atRisk = debtors.filter((d) => d.status !== “ok”).reduce((s, d) => s + (d.amount || 0), 0);
+const defaultCount = debtors.filter((d) => d.status === “default”).length;
+const avgScore = debtors.length
+? Math.round(debtors.reduce((s, d) => s + computeScore(d).score, 0) / debtors.length)
+: 0;
+return { total, atRisk, defaultCount, avgScore, count: debtors.length };
+}, [debtors]);
+
+if (!loaded) {
+return (
+<div style={{ …styles.app, display: “flex”, alignItems: “center”, justifyContent: “center”, minHeight: “100vh” }}>
+<Loader2 size={28} color="#C0392B" className="spin" />
+<style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }`}</style>
+</div>
+);
+}
+
+return (
+<div style={styles.app}>
+<style>{fontImport}</style>
+<Starfield />
+<div style={styles.vignette} aria-hidden="true" />
+
+```
+  <header style={styles.header}>
+    <div style={styles.brandRow}>
+      <div style={styles.brandMark}>DL</div>
+      <div>
+        <div style={styles.brandTitle}>DEBTOR LEDGER PRO</div>
+        <div style={styles.brandSub}>
+          ตรวจสอบ · ให้คะแนนความน่าเชื่อถือ · ติดตามทวงหนี้
+          {saving && <span style={{ color: "#F5B942", marginLeft: 8 }}>กำลังบันทึก...</span>}
+          {error && <span style={{ color: "#E23B3B", marginLeft: 8 }}>{error}</span>}
+        </div>
+      </div>
+    </div>
+    <nav style={styles.nav}>
+      {[
+        { key: "check", label: "ตรวจสอบก่อนปล่อยกู้" },
+        { key: "list", label: "ทะเบียนลูกหนี้" },
+        { key: "dashboard", label: "ภาพรวมพอร์ต" },
+        { key: "add", label: "+ เพิ่มรายชื่อ" },
+      ].map((t) => (
+        <button
+          key={t.key}
+          onClick={() => {
+            setView(t.key);
+            setSelected(null);
+            if (t.key !== "check") setQuery("");
+            setCheckResult(null);
+          }}
+          style={{ ...styles.navBtn, ...(view === t.key ? styles.navBtnActive : {}) }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </nav>
+  </header>
+
+  <main style={styles.main}>
+    {view === "check" && (
+      <CheckView
+        query={query} setQuery={setQuery} runCheck={runCheck}
+        checkResult={checkResult} setCheckResult={setCheckResult}
+        worstStatus={worstStatus} onSelect={setSelected}
+      />
+    )}
+
+    {view === "list" && (
+      <ListView
+        query={query} setQuery={setQuery} list={filteredList} onSelect={setSelected}
+      />
+    )}
+
+    {view === "dashboard" && <DashboardView stats={portfolioStats} debtors={debtors} onSelect={setSelected} />}
+
+    {view === "add" && (
+      <AddView form={form} setForm={setForm} handleFiles={handleFiles} saveDebtor={saveDebtor} />
+    )}
+  </main>
+
+  {selected && (
+    <DetailDrawer
+      debtor={selected}
+      onClose={() => setSelected(null)}
+      onDelete={deleteDebtor}
+      onAddContact={addContact}
+      onAddPayment={addPayment}
+      onUpdateStatus={(status) => updateDebtor(selected.id, { status })}
+    />
+  )}
+</div>
+```
+
+);
+}
+
+// ––––––––––––––––––––––––––––– CheckView ––
+function CheckView({ query, setQuery, runCheck, checkResult, setCheckResult, worstStatus, onSelect }) {
+return (
+<div>
+<div style={styles.checkPanel}>
+<div style={styles.eyebrow}>ก่อนปล่อยยอดใหม่</div>
+<h1 style={styles.checkTitle}>เคยมีประวัติกับเรามาก่อนไหม?</h1>
+<p style={styles.checkDesc}>กรอกชื่อ-นามสกุล หรือเบอร์โทรของผู้ขอกู้ เพื่อตรวจสอบประวัติและคะแนนความน่าเชื่อถือ</p>
+<div style={styles.searchRow}>
+<Search size={18} color=”#8A8A8A” style={{ flexShrink: 0 }} />
+<input
+autoFocus value={query}
+onChange={(e) => { setQuery(e.target.value); if (checkResult !== null) setCheckResult(null); }}
+onKeyDown={(e) => e.key === “Enter” && runCheck()}
+placeholder=“ชื่อ-นามสกุล หรือเบอร์โทร”
+style={styles.searchInput}
+/>
+<button style={styles.checkBtn} onClick={runCheck}>ตรวจสอบ</button>
+</div>
+</div>
+
+```
+  {checkResult !== null && (
+    <div style={{ marginTop: 28 }}>
+      {checkResult.length === 0 ? (
+        <div style={styles.clearCard}>
+          <ShieldCheck size={28} color="#7DD3A0" />
+          <div>
+            <div style={styles.clearTitle}>ไม่พบประวัติ</div>
+            <div style={styles.clearSub}>ยังไม่เคยมีธุรกรรมกับคุณมาก่อน</div>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div style={{
+            ...styles.alertBanner,
+            borderColor: STATUS[worstStatus(checkResult)].color,
+            background: worstStatus(checkResult) === "default" ? "rgba(226,59,59,0.12)" : "rgba(245,185,66,0.10)",
+          }}>
+            <AlertTriangle size={26} color={STATUS[worstStatus(checkResult)].color} />
+            <div>
+              <div style={{ ...styles.clearTitle, color: STATUS[worstStatus(checkResult)].color }}>
+                พบประวัติ {checkResult.length} รายการ
+              </div>
+              <div style={styles.clearSub}>
+                {worstStatus(checkResult) === "default"
+                  ? "มีประวัติเบี้ยวหนี้ — พิจารณาอย่างรอบคอบก่อนปล่อยยอดใหม่"
+                  : "มีประวัติค้างชำระ — ตรวจสอบรายละเอียดก่อนตัดสินใจ"}
+              </div>
+            </div>
+          </div>
+          <div style={styles.resultGrid}>
+            {checkResult.map((d) => <DebtorCard key={d.id} d={d} onClick={() => onSelect(d)} />)}
+          </div>
+        </div>
+      )}
+    </div>
+  )}
+</div>
+```
+
+);
+}
+
+// ———————————————————– ListView ––
+function ListView({ query, setQuery, list, onSelect }) {
+return (
+<div>
+<div style={styles.listHeadRow}>
+<h2 style={styles.sectionTitle}>ทะเบียนลูกหนี้ทั้งหมด</h2>
+<div style={styles.searchRowSmall}>
+<Search size={16} color="#8A8A8A" />
+<input value={query} onChange={(e) => setQuery(e.target.value)} placeholder=“ค้นหาในทะเบียน…” style={styles.searchInputSmall} />
+</div>
+</div>
+{list.length === 0 ? (
+<div style={styles.emptyState}>ไม่มีข้อมูลในทะเบียน</div>
+) : (
+<div style={styles.resultGrid}>
+{list.map((d) => <DebtorCard key={d.id} d={d} onClick={() => onSelect(d)} />)}
+</div>
+)}
+</div>
+);
+}
+
+// –––––––––––––––––––––––––––– DashboardView –
+function DashboardView({ stats, debtors, onSelect }) {
+const sorted = […debtors].sort((a, b) => computeScore(a).score - computeScore(b).score);
+return (
+<div>
+<h2 style={styles.sectionTitle}>ภาพรวมพอร์ตสินเชื่อ</h2>
+<div style={styles.statGrid}>
+<StatCard label=“ยอดปล่อยกู้รวม” value={THB(stats.total)} icon={<BarChart3 size={18} />} />
+<StatCard label=“ยอดมีความเสี่ยง” value={THB(stats.atRisk)} icon={<TrendingDown size={18} />} accent=”#E23B3B” />
+<StatCard label=“จำนวนเบี้ยวหนี้” value={`${stats.defaultCount} คน`} icon={<AlertTriangle size={18} />} accent=”#E23B3B” />
+<StatCard label=“คะแนนเฉลี่ยพอร์ต” value={`${stats.avgScore}/100`} icon={<TrendingUp size={18} />} accent=”#7DD3A0” />
+</div>
+
+```
+  <div style={{ marginTop: 30 }}>
+    <div style={styles.eyebrow}>เรียงจากความเสี่ยงสูงสุด</div>
+    <div style={styles.rankList}>
+      {sorted.map((d, i) => {
+        const { score, grade } = computeScore(d);
+        return (
+          <button key={d.id} style={styles.rankRow} onClick={() => onSelect(d)}>
+            <span style={styles.rankIndex}>{i + 1}</span>
+            <span style={{ flex: 1, textAlign: "left" }}>{d.name}</span>
+            <span style={{ fontSize: 12.5, color: "#9C9490" }}>{THB(d.amount)}</span>
+            <span style={{ ...styles.gradeBadge, background: GRADE_COLORS[grade] }}>{grade}</span>
+            <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 13, width: 34, textAlign: "right" }}>{score}</span>
+          </button>
+        );
+      })}
+    </div>
+  </div>
+</div>
+```
+
+);
+}
+
+function StatCard({ label, value, icon, accent = “#C0392B” }) {
+return (
+<div style={styles.statCard}>
+<div style={{ color: accent }}>{icon}</div>
+<div style={styles.statValue}>{value}</div>
+<div style={styles.statLabel}>{label}</div>
+</div>
+);
+}
+
+// ———————————————————–– AddView —
+function AddView({ form, setForm, handleFiles, saveDebtor }) {
+return (
+<div style={styles.formPanel}>
+<h2 style={styles.sectionTitle}>เพิ่มรายชื่อลูกหนี้</h2>
+<div style={styles.formGrid}>
+<Field label="ชื่อ-นามสกุล *">
+<input style={styles.input} value={form.name} onChange={(e) => setForm({ …form, name: e.target.value })} placeholder=“เช่น สมชาย ใจดี” />
+</Field>
+<Field label="เบอร์โทรศัพท์">
+<input style={styles.input} value={form.phone} onChange={(e) => setForm({ …form, phone: e.target.value })} placeholder=“08X-XXX-XXXX” />
+</Field>
+<Field label="ยอดหนี้ (บาท)">
+<input type=“number” style={styles.input} value={form.amount} onChange={(e) => setForm({ …form, amount: e.target.value })} placeholder=“0” />
+</Field>
+<Field label="วันที่ทำสัญญา">
+<input type=“date” style={styles.input} value={form.date} onChange={(e) => setForm({ …form, date: e.target.value })} />
+</Field>
+<Field label="สถานะ" full>
+<div style={styles.statusPicker}>
+{Object.entries(STATUS).map(([key, s]) => (
+<button key={key} onClick={() => setForm({ …form, status: key })}
+style={{ …styles.statusChip, borderColor: s.color, background: form.status === key ? s.color + “22” : “transparent”, color: s.color }}>
+{s.label}
+</button>
+))}
+</div>
+</Field>
+<Field label="หมายเหตุ (สาเหตุ / สถานการณ์)" full>
+<textarea style={{ …styles.input, minHeight: 90, resize: “vertical” }} value={form.note} onChange={(e) => setForm({ …form, note: e.target.value })} placeholder=“เช่น อ้างว่าตกงาน…” />
+</Field>
+<Field label="แนบรูปสัญญา / เอกสาร" full>
+<label style={styles.uploadBox}>
+<FileText size={20} color="#B0453A" />
+<span>คลิกเพื่อแนบไฟล์รูปภาพ (สูงสุด 4 รูป)</span>
+<input type=“file” accept=“image/*” multiple style={{ display: “none” }} onChange={(e) => handleFiles(e.target.files)} />
+</label>
+{form.attachments.length > 0 && (
+<div style={styles.thumbRow}>
+{form.attachments.map((src, i) => (
+<div key={i} style={styles.thumbWrap}>
+<img src={src} style={styles.thumb} alt="attachment" />
+<button style={styles.thumbRemove} onClick={() => setForm((f) => ({ …f, attachments: f.attachments.filter((_, idx) => idx !== i) }))}>
+<X size={12} />
+</button>
+</div>
+))}
+</div>
+)}
+</Field>
+</div>
+<div style={styles.formActions}>
+<button style={styles.secondaryBtn} onClick={() => setForm({ name: “”, phone: “”, amount: “”, date: “”, status: “ok”, note: “”, attachments: [] })}>ล้างฟอร์ม</button>
+<button style={styles.primaryBtn} onClick={saveDebtor} disabled={!form.name.trim()}>
+<Plus size={16} /> บันทึกลงทะเบียน
+</button>
+</div>
+</div>
+);
+}
+
+function Field({ label, children, full }) {
+return (
+<div style={{ gridColumn: full ? “1 / -1” : “auto” }}>
+<div style={styles.fieldLabel}>{label}</div>
+{children}
+</div>
+);
+}
+
+function DebtorCard({ d, onClick }) {
+const s = STATUS[d.status];
+const { score, grade } = computeScore(d);
+return (
+<button style={styles.card} onClick={onClick}>
+<div style={styles.cardTop}>
+<div style={{ …styles.dot, background: s.color }} />
+<span style={{ color: s.color, fontSize: 12, fontWeight: 600, letterSpacing: 0.5 }}>{s.label.toUpperCase()}</span>
+<span style={{ …styles.gradeBadgeSmall, background: GRADE_COLORS[grade] }}>{grade} · {score}</span>
+</div>
+<div style={styles.cardName}>{d.name}</div>
+<div style={styles.cardPhone}><Phone size={12} /> {d.phone || “ไม่ระบุ”}</div>
+<div style={styles.cardAmount}>{THB(d.amount)}</div>
+{d.note && <div style={styles.cardNote}>{d.note}</div>}
+<div style={styles.cardArrow}><ChevronRight size={16} /></div>
+</button>
+);
+}
+
+// –––––––––––––––––––––––––––– DetailDrawer —
+function DetailDrawer({ debtor, onClose, onDelete, onAddContact, onAddPayment, onUpdateStatus }) {
+const [tab, setTab] = useState(“overview”);
+const { score, grade, factors } = computeScore(debtor);
+const s = STATUS[debtor.status];
+const deadline = statuteDeadline(debtor.date);
+const daysToDeadline = deadline ? daysBetween(new Date().toISOString(), deadline) : null;
+
+const [contactNote, setContactNote] = useState(””);
+const [contactOutcome, setContactOutcome] = useState(“no_answer”);
+const [msgLevel, setMsgLevel] = useState(“first”);
+
+const submitContact = () => {
+onAddContact(debtor.id, {
+id: uid(),
+date: new Date().toISOString().slice(0, 10),
+outcome: contactOutcome,
+note: contactNote,
+});
+setContactNote(””);
+};
+
+const timeline = […(debtor.contactLog || [])].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+return (
+<div style={styles.overlay} onClick={onClose}>
+<div style={styles.drawer} onClick={(e) => e.stopPropagation()}>
+<button style={styles.drawerClose} onClick={onClose}><X size={18} /></button>
+
+```
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+      <div style={{ ...styles.statusTag, background: s.color, marginBottom: 0 }}>{s.label}</div>
+      <div style={{ ...styles.gradeBadge, background: GRADE_COLORS[grade] }}>{grade}</div>
+      <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 15, color: "#EDE7E4" }}>{score}/100</span>
+    </div>
+
+    <h3 style={styles.drawerName}>{debtor.name}</h3>
+    <div style={styles.drawerRow}><Phone size={14} color="#8A8A8A" /> {debtor.phone || "ไม่ระบุ"}</div>
+    <div style={styles.drawerAmount}>{THB(debtor.amount)}</div>
+    <div style={styles.drawerMeta}>วันที่ทำสัญญา: {fmtDate(debtor.date)}</div>
+
+    {deadline && (
+      <div style={styles.deadlineBox}>
+        <Clock size={13} color="#B0453A" />
+        <span>อายุความคดี (ประมาณการ 10 ปี): {fmtDate(deadline)} {daysToDeadline > 0 ? `(เหลือ ${daysToDeadline} วัน)` : "(เลยกำหนดแล้ว)"}</span>
+      </div>
+    )}
+
+    <div style={styles.tabRow}>
+      {[
+        { key: "overview", label: "ภาพรวม" },
+        { key: "score", label: "คะแนน" },
+        { key: "timeline", label: "ทวงถาม" },
+        { key: "message", label: "ร่างข้อความ" },
+      ].map((t) => (
+        <button key={t.key} onClick={() => setTab(t.key)} style={{ ...styles.tabBtn, ...(tab === t.key ? styles.tabBtnActive : {}) }}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+
+    {tab === "overview" && (
+      <div>
+        {debtor.note && (
+          <div style={styles.noteBox}>
+            <div style={styles.noteLabel}>หมายเหตุ</div>
+            <div style={styles.noteText}>{debtor.note}</div>
+          </div>
+        )}
+        <div style={styles.noteLabel}>เปลี่ยนสถานะ</div>
+        <div style={{ ...styles.statusPicker, marginBottom: 18 }}>
+          {Object.entries(STATUS).map(([key, st]) => (
+            <button key={key} onClick={() => onUpdateStatus(key)}
+              style={{ ...styles.statusChip, borderColor: st.color, background: debtor.status === key ? st.color + "22" : "transparent", color: st.color }}>
+              {st.label}
+            </button>
+          ))}
+        </div>
+        {debtor.attachments?.length > 0 && (
+          <div>
+            <div style={styles.noteLabel}>เอกสารแนบ</div>
+            <div style={styles.thumbRow}>
+              {debtor.attachments.map((src, i) => <img key={i} src={src} style={styles.thumbLarge} alt="doc" />)}
+            </div>
+          </div>
+        )}
+        <button style={styles.deleteBtn} onClick={() => onDelete(debtor.id)}>
+          <Trash2 size={14} /> ลบรายการนี้
+        </button>
+      </div>
+    )}
+
+    {tab === "score" && (
+      <div>
+        <div style={styles.scoreBig}>
+          <div style={{ ...styles.gradeCircle, borderColor: GRADE_COLORS[grade] }}>
+            <span style={{ fontSize: 26, fontWeight: 800, color: GRADE_COLORS[grade] }}>{grade}</span>
+          </div>
+          <div>
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 24, fontWeight: 700 }}>{score}/100</div>
+            <div style={{ fontSize: 12.5, color: "#9C9490" }}>คะแนนความน่าเชื่อถือ</div>
+          </div>
+        </div>
+        <div style={styles.noteLabel}>ปัจจัยที่มีผล</div>
+        <div style={styles.factorList}>
+          {factors.map((f, i) => (
+            <div key={i} style={styles.factorRow}>
+              <span style={{ flex: 1, fontSize: 13 }}>{f.label}</span>
+              <span style={{ color: f.impact >= 0 ? "#7DD3A0" : "#E8837A", fontFamily: "'Space Mono', monospace", fontSize: 13, fontWeight: 700 }}>
+                {f.impact >= 0 ? "+" : ""}{f.impact}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div style={styles.noteLabel}>บันทึกการชำระ</div>
+        <div style={styles.factorList}>
+          {(debtor.payments || []).length === 0 && <div style={{ fontSize: 12.5, color: "#7A7472" }}>ยังไม่มีบันทึกการชำระ</div>}
+          {(debtor.payments || []).map((p) => (
+            <div key={p.id} style={styles.factorRow}>
+              <span style={{ fontSize: 12.5, color: "#9C9490" }}>{fmtDate(p.date)}</span>
+              <span style={{ flex: 1, textAlign: "right", marginRight: 10, fontFamily: "'Space Mono', monospace", fontSize: 13 }}>{THB(p.amount)}</span>
+              <span style={{ fontSize: 11.5, color: p.onTime ? "#7DD3A0" : "#E8837A" }}>{p.onTime ? "ตรงเวลา" : "ล่าช้า"}</span>
+            </div>
+          ))}
+        </div>
+        <QuickAddPayment onAdd={(entry) => onAddPayment(debtor.id, entry)} />
+      </div>
+    )}
+
+    {tab === "timeline" && (
+      <div>
+        <div style={styles.noteLabel}>บันทึกการติดต่อใหม่</div>
+        <select value={contactOutcome} onChange={(e) => setContactOutcome(e.target.value)} style={{ ...styles.input, marginBottom: 8 }}>
+          {CONTACT_OUTCOMES.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
+        </select>
+        <textarea style={{ ...styles.input, minHeight: 60, marginBottom: 8 }} placeholder="รายละเอียดเพิ่มเติม..." value={contactNote} onChange={(e) => setContactNote(e.target.value)} />
+        <button style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginBottom: 20 }} onClick={submitContact}>
+          <MessageSquare size={14} /> บันทึกการติดต่อ
+        </button>
+
+        <div style={styles.noteLabel}>ไทม์ไลน์การทวงถาม</div>
+        {timeline.length === 0 ? (
+          <div style={{ fontSize: 12.5, color: "#7A7472" }}>ยังไม่มีบันทึกการติดต่อ</div>
+        ) : (
+          <div style={styles.timelineList}>
+            {timeline.map((c) => {
+              const o = CONTACT_OUTCOMES.find((x) => x.key === c.outcome);
+              return (
+                <div key={c.id} style={styles.timelineItem}>
+                  <div style={styles.timelineDot} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>{o?.label}</span>
+                      <span style={{ fontSize: 11.5, color: "#8A8480" }}>{fmtDate(c.date)}</span>
+                    </div>
+                    {c.note && <div style={{ fontSize: 12.5, color: "#B0A8A4", marginTop: 3 }}>{c.note}</div>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    )}
+
+    {tab === "message" && (
+      <div>
+        <div style={styles.noteLabel}>ระดับข้อความ</div>
+        <div style={{ ...styles.statusPicker, marginBottom: 14 }}>
+          {[{ k: "first", l: "เตือนครั้งแรก" }, { k: "final", l: "เตือนครั้งสุดท้าย" }, { k: "legal", l: "แจ้งดำเนินคดี" }].map((m) => (
+            <button key={m.k} onClick={() => setMsgLevel(m.k)}
+              style={{ ...styles.statusChip, borderColor: "#C0392B", background: msgLevel === m.k ? "#C0392B22" : "transparent", color: "#E8837A" }}>
+              {m.l}
+            </button>
+          ))}
+        </div>
+        <div style={styles.messageBox}>{draftMessage(debtor, msgLevel)}</div>
+        <div style={{ fontSize: 11.5, color: "#7A7472", marginTop: 8 }}>
+          ร่างข้อความนี้เป็นแนวทางเบื้องต้นเท่านั้น ก่อนใช้ในการดำเนินคดีจริง แนะนำให้ตรวจสอบกับนักกฎหมายก่อนส่ง
+        </div>
+      </div>
+    )}
+  </div>
+</div>
+```
+
+);
+}
+
+function QuickAddPayment({ onAdd }) {
+const [amount, setAmount] = useState(””);
+const [onTime, setOnTime] = useState(true);
+return (
+<div style={{ marginTop: 12 }}>
+<div style={styles.noteLabel}>บันทึกการชำระใหม่</div>
+<div style={{ display: “flex”, gap: 8 }}>
+<input type=“number” placeholder=“จำนวนเงิน” value={amount} onChange={(e) => setAmount(e.target.value)} style={{ …styles.input, flex: 1 }} />
+<select value={onTime ? “yes” : “no”} onChange={(e) => setOnTime(e.target.value === “yes”)} style={{ …styles.input, width: 110 }}>
+<option value="yes">ตรงเวลา</option>
+<option value="no">ล่าช้า</option>
+</select>
+<button style={styles.primaryBtn} onClick={() => {
+if (!amount) return;
+onAdd({ id: uid(), date: new Date().toISOString().slice(0, 10), amount: Number(amount), onTime });
+setAmount(””);
+}}>
+<Plus size={14} />
+</button>
+</div>
+</div>
+);
+}
+
+// ============================================================ styles ====
+const fontImport = `
+@import url(‘https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&family=Courier+Prime:wght@400;700&display=swap’);
+
+- { box-sizing: border-box; font-family: ‘Noto Sans Thai’, sans-serif; }
+  ::placeholder { color: #6B6664; }
+  input, textarea, select { font-family: ‘Noto Sans Thai’, sans-serif; }
+  `;
+
+const RED = “#C0392B”;
+const RED_DEEP = “#8B1E1E”;
+const INK = “#0E0C0C”;
+const PANEL = “#171313”;
+const LINE = “#2A2222”;
+
+const styles = {
+app: {
+minHeight: “100vh”,
+position: “relative”,
+background: “radial-gradient(ellipse at 50% -10%, #1A1218 0%, #0E0C0C 45%, #0A0909 100%)”,
+color: “#EDE7E4”,
+padding: “0 0 60px”,
+overflowX: “hidden”,
+},
+starCanvas: {
+position: “fixed”,
+inset: 0,
+width: “100%”,
+height: “100%”,
+zIndex: 0,
+pointerEvents: “none”,
+opacity: 0.85,
+},
+vignette: {
+position: “fixed”,
+inset: 0,
+zIndex: 1,
+pointerEvents: “none”,
+background: “radial-gradient(ellipse at 50% 0%, transparent 0%, transparent 40%, rgba(10,9,9,0.55) 85%, rgba(10,9,9,0.85) 100%)”,
+},
+header: {
+display: “flex”, flexDirection: “column”, gap: 18, padding: “28px 24px 20px”,
+borderBottom: `1px solid ${LINE}`, background: “linear-gradient(180deg, rgba(21,15,15,0.92) 0%, rgba(14,12,12,0.92) 100%)”,
+backdropFilter: “blur(6px)”,
+position: “sticky”, top: 0, zIndex: 5,
+},
+brandRow: { display: “flex”, alignItems: “center”, gap: 12 },
+brandMark: { width: 42, height: 42, borderRadius: 4, background: RED, color: “#0E0C0C”, display: “flex”, alignItems: “center”, justifyContent: “center”, fontFamily: “‘Courier Prime’, ‘Space Mono’, monospace”, fontWeight: 700, fontSize: 14, flexShrink: 0 },
+brandTitle: { fontFamily: “‘Courier Prime’, ‘Space Mono’, monospace”, fontWeight: 700, fontSize: 17, letterSpacing: 2, color: “#F2EDEA” },
+brandSub: { fontSize: 12.5, color: “#9C9490”, marginTop: 2 },
+nav: { display: “flex”, gap: 8, flexWrap: “wrap” },
+navBtn: { background: “transparent”, border: `1px solid ${LINE}`, color: “#B8B0AC”, padding: “8px 14px”, borderRadius: 6, fontSize: 13, fontWeight: 500, cursor: “pointer” },
+navBtnActive: { background: RED, borderColor: RED, color: “#0E0C0C”, fontWeight: 700 },
+main: { maxWidth: 900, margin: “0 auto”, padding: “32px 20px 0”, position: “relative”, zIndex: 2 },
+
+eyebrow: { fontFamily: “‘Courier Prime’, ‘Space Mono’, monospace”, fontSize: 11.5, letterSpacing: 2.5, color: RED, marginBottom: 10, fontWeight: 700, textTransform: “uppercase” },
+checkPanel: { background: “rgba(23,19,19,0.88)”, backdropFilter: “blur(4px)”, border: `1px solid ${LINE}`, borderRadius: 10, padding: “32px 28px”, boxShadow: “0 0 40px rgba(0,0,0,0.4)” },
+checkTitle: { fontSize: 26, fontWeight: 800, letterSpacing: 0.2, margin: “0 0 10px”, color: “#F5F0EE” },
+checkDesc: { color: “#A79F9B”, fontSize: 14.5, lineHeight: 1.6, margin: “0 0 22px” },
+searchRow: { display: “flex”, alignItems: “center”, gap: 10, background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 8, padding: “12px 16px” },
+searchInput: { flex: 1, background: “transparent”, border: “none”, outline: “none”, color: “#F0EBE8”, fontSize: 15 },
+checkBtn: { background: RED, border: “none”, color: “#0E0C0C”, fontWeight: 700, padding: “10px 20px”, borderRadius: 6, cursor: “pointer”, fontSize: 14, flexShrink: 0 },
+
+clearCard: { display: “flex”, alignItems: “center”, gap: 16, background: “rgba(125,211,160,0.08)”, border: “1px solid #7DD3A0”, borderRadius: 10, padding: “20px 22px” },
+clearTitle: { fontSize: 16, fontWeight: 700, color: “#EDE7E4” },
+clearSub: { fontSize: 13.5, color: “#A79F9B”, marginTop: 3 },
+
+alertBanner: { display: “flex”, alignItems: “center”, gap: 16, border: “1px solid”, borderRadius: 10, padding: “20px 22px”, marginBottom: 18 },
+
+resultGrid: { display: “grid”, gridTemplateColumns: “repeat(auto-fill, minmax(260px, 1fr))”, gap: 14, marginTop: 4 },
+
+card: { textAlign: “left”, background: “rgba(23,19,19,0.88)”, backdropFilter: “blur(4px)”, border: `1px solid ${LINE}`, borderRadius: 10, padding: “16px 18px”, cursor: “pointer”, position: “relative”, color: “#EDE7E4”, boxShadow: “0 0 24px rgba(0,0,0,0.35)” },
+cardTop: { display: “flex”, alignItems: “center”, gap: 6, marginBottom: 8, flexWrap: “wrap” },
+dot: { width: 7, height: 7, borderRadius: “50%” },
+cardName: { fontSize: 16, fontWeight: 700, marginBottom: 4 },
+cardPhone: { display: “flex”, alignItems: “center”, gap: 5, fontSize: 12.5, color: “#9C9490”, marginBottom: 8 },
+cardAmount: { fontFamily: “‘Space Mono’, monospace”, fontSize: 15, color: “#E8B4AE”, fontWeight: 700 },
+cardNote: { marginTop: 10, fontSize: 12.5, color: “#8A8480”, borderTop: `1px solid ${LINE}`, paddingTop: 8, lineHeight: 1.5 },
+cardArrow: { position: “absolute”, top: 16, right: 14, color: “#5A5350” },
+
+gradeBadgeSmall: { marginLeft: “auto”, fontSize: 10.5, fontWeight: 800, color: “#0E0C0C”, padding: “2px 7px”, borderRadius: 10 },
+gradeBadge: { fontSize: 13, fontWeight: 800, color: “#0E0C0C”, padding: “3px 10px”, borderRadius: 6 },
+
+sectionTitle: { fontSize: 19, fontWeight: 800, color: “#F2EDEA” },
+listHeadRow: { display: “flex”, justifyContent: “space-between”, alignItems: “center”, flexWrap: “wrap”, gap: 12, marginBottom: 18 },
+searchRowSmall: { display: “flex”, alignItems: “center”, gap: 8, background: PANEL, border: `1px solid ${LINE}`, borderRadius: 6, padding: “8px 12px” },
+searchInputSmall: { background: “transparent”, border: “none”, outline: “none”, color: “#EDE7E4”, fontSize: 13.5, width: 180 },
+emptyState: { color: “#7A7472”, fontSize: 14, padding: “40px 0”, textAlign: “center” },
+
+statGrid: { display: “grid”, gridTemplateColumns: “repeat(auto-fit, minmax(180px, 1fr))”, gap: 14, marginTop: 18 },
+statCard: { background: “rgba(23,19,19,0.88)”, backdropFilter: “blur(4px)”, border: `1px solid ${LINE}`, borderRadius: 10, padding: “18px”, boxShadow: “0 0 24px rgba(0,0,0,0.35)” },
+statValue: { fontFamily: “‘Space Mono’, monospace”, fontSize: 22, fontWeight: 700, marginTop: 10 },
+statLabel: { fontSize: 12, color: “#9C9490”, marginTop: 4 },
+
+rankList: { display: “flex”, flexDirection: “column”, gap: 6 },
+rankRow: { display: “flex”, alignItems: “center”, gap: 12, background: “rgba(23,19,19,0.85)”, backdropFilter: “blur(3px)”, border: `1px solid ${LINE}`, borderRadius: 8, padding: “10px 14px”, cursor: “pointer”, color: “#EDE7E4” },
+rankIndex: { fontFamily: “‘Space Mono’, monospace”, fontSize: 12, color: “#6B6664”, width: 18 },
+
+formPanel: { background: “rgba(23,19,19,0.9)”, backdropFilter: “blur(4px)”, border: `1px solid ${LINE}`, borderRadius: 10, padding: 26, boxShadow: “0 0 40px rgba(0,0,0,0.4)” },
+formGrid: { display: “grid”, gridTemplateColumns: “1fr 1fr”, gap: 18, marginTop: 20 },
+fieldLabel: { fontSize: 12.5, color: “#B0453A”, fontWeight: 700, marginBottom: 6, letterSpacing: 0.3 },
+input: { width: “100%”, background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 6, padding: “10px 12px”, color: “#EDE7E4”, fontSize: 14, outline: “none” },
+statusPicker: { display: “flex”, gap: 10, flexWrap: “wrap” },
+statusChip: { border: “1px solid”, borderRadius: 20, padding: “7px 16px”, fontSize: 13, fontWeight: 600, cursor: “pointer”, background: “transparent” },
+uploadBox: { display: “flex”, alignItems: “center”, gap: 10, border: `1.5px dashed ${RED_DEEP}`, borderRadius: 8, padding: “16px 18px”, color: “#C9938E”, fontSize: 13.5, cursor: “pointer” },
+thumbRow: { display: “flex”, gap: 10, marginTop: 12, flexWrap: “wrap” },
+thumbWrap: { position: “relative”, width: 64, height: 64 },
+thumb: { width: 64, height: 64, objectFit: “cover”, borderRadius: 6, border: `1px solid ${LINE}` },
+thumbLarge: { width: 100, height: 100, objectFit: “cover”, borderRadius: 6, border: `1px solid ${LINE}` },
+thumbRemove: { position: “absolute”, top: -6, right: -6, background: RED, border: “none”, borderRadius: “50%”, width: 18, height: 18, display: “flex”, alignItems: “center”, justifyContent: “center”, cursor: “pointer”, color: “#0E0C0C” },
+formActions: { display: “flex”, justifyContent: “flex-end”, gap: 10, marginTop: 26 },
+secondaryBtn: { background: “transparent”, border: `1px solid ${LINE}`, color: “#B8B0AC”, padding: “10px 18px”, borderRadius: 6, cursor: “pointer”, fontSize: 13.5 },
+primaryBtn: { display: “flex”, alignItems: “center”, gap: 6, background: RED, border: “none”, color: “#0E0C0C”, fontWeight: 700, padding: “10px 20px”, borderRadius: 6, cursor: “pointer”, fontSize: 13.5 },
+
+overlay: { position: “fixed”, inset: 0, background: “rgba(0,0,0,0.7)”, display: “flex”, justifyContent: “flex-end”, zIndex: 20 },
+drawer: { width: 420, maxWidth: “92vw”, height: “100%”, background: “linear-gradient(180deg, #1A1414 0%, #171313 100%)”, borderLeft: `1px solid ${RED_DEEP}`, boxShadow: “-30px 0 60px rgba(0,0,0,0.5), -1px 0 0 rgba(192,57,43,0.15)”, padding: “28px 24px”, overflowY: “auto”, position: “relative” },
+drawerClose: { position: “absolute”, top: 20, right: 20, background: “transparent”, border: `1px solid ${LINE}`, borderRadius: 6, color: “#B8B0AC”, cursor: “pointer”, padding: 6 },
+statusTag: { display: “inline-block”, color: “#0E0C0C”, fontSize: 11.5, fontWeight: 800, padding: “4px 10px”, borderRadius: 4, letterSpacing: 0.5, marginBottom: 14 },
+drawerName: { fontSize: 22, fontWeight: 800, margin: “0 0 10px” },
+drawerRow: { display: “flex”, alignItems: “center”, gap: 6, fontSize: 13.5, color: “#A79F9B”, marginBottom: 14 },
+drawerAmount: { fontFamily: “‘Space Mono’, monospace”, fontSize: 26, fontWeight: 700, color: “#E8B4AE”, marginBottom: 4 },
+drawerMeta: { fontSize: 12.5, color: “#8A8480”, marginBottom: 10 },
+deadlineBox: { display: “flex”, alignItems: “center”, gap: 6, fontSize: 12, color: “#C9938E”, background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 6, padding: “8px 10px”, marginBottom: 16 },
+
+tabRow: { display: “flex”, gap: 6, borderBottom: `1px solid ${LINE}`, marginBottom: 18, flexWrap: “wrap” },
+tabBtn: { background: “transparent”, border: “none”, color: “#8A8480”, padding: “8px 4px”, fontSize: 13, cursor: “pointer”, borderBottom: “2px solid transparent”, marginRight: 14 },
+tabBtnActive: { color: RED, borderBottomColor: RED, fontWeight: 700 },
+
+noteBox: { background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 8, padding: 14, marginBottom: 20 },
+noteLabel: { fontSize: 11.5, color: “#B0453A”, fontWeight: 700, marginBottom: 6, letterSpacing: 0.5, marginTop: 4 },
+noteText: { fontSize: 13.5, lineHeight: 1.6, color: “#D4CDC9” },
+deleteBtn: { display: “flex”, alignItems: “center”, gap: 6, marginTop: 10, background: “transparent”, border: `1px solid ${RED_DEEP}`, color: “#E8837A”, padding: “9px 16px”, borderRadius: 6, cursor: “pointer”, fontSize: 13 },
+
+scoreBig: { display: “flex”, alignItems: “center”, gap: 16, marginBottom: 20 },
+gradeCircle: { width: 56, height: 56, borderRadius: “50%”, border: “3px solid”, display: “flex”, alignItems: “center”, justifyContent: “center” },
+factorList: { display: “flex”, flexDirection: “column”, gap: 6, marginBottom: 18 },
+factorRow: { display: “flex”, alignItems: “center”, gap: 8, background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 6, padding: “8px 12px” },
+
+timelineList: { display: “flex”, flexDirection: “column”, gap: 14, marginTop: 4 },
+timelineItem: { display: “flex”, gap: 10 },
+timelineDot: { width: 8, height: 8, borderRadius: “50%”, background: RED, marginTop: 5, flexShrink: 0 },
+
+messageBox: { background: “#0E0C0C”, border: `1px solid ${LINE}`, borderRadius: 8, padding: 16, fontSize: 13, lineHeight: 1.7, whiteSpace: “pre-wrap”, color: “#D4CDC9” },
+};
